@@ -21,6 +21,12 @@ pub struct ClothMatExt {
 
 impl MaterialExtension for ClothMatExt {
     fn enable_prepass() -> bool {
+        // View prepass uses a depth-only layout without material bindings; our
+        // prepass vertex still reads sim buffers (shadow pass only).
+        false
+    }
+
+    fn enable_shadows() -> bool {
         false
     }
 
@@ -28,12 +34,24 @@ impl MaterialExtension for ClothMatExt {
         CLOTH_MAT_WGSL.into()
     }
 
+    fn prepass_vertex_shader() -> ShaderRef {
+        CLOTH_MAT_WGSL.into()
+    }
+
     fn fragment_shader() -> ShaderRef {
         CLOTH_MAT_WGSL.into()
     }
 
-    fn deferred_fragment_shader() -> ShaderRef {
+    fn prepass_fragment_shader() -> ShaderRef {
+        ShaderRef::Default
+    }
+
+    fn deferred_vertex_shader() -> ShaderRef {
         CLOTH_MAT_WGSL.into()
+    }
+
+    fn deferred_fragment_shader() -> ShaderRef {
+        ShaderRef::Default
     }
 }
 

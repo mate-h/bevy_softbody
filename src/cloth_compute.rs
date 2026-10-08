@@ -5,8 +5,8 @@
 //! (see [`ClothMeshData::constraint_batch_offsets`](crate::mesh_prep::ClothMeshData)). λ is cleared before each
 //! inner iteration. Compliance α comes from [`crate::mesh_prep`].
 //!
-//! **Gauss–Seidel batches:** Each inner iteration clears λ (`clear_constraint_lambda`), then **`gs_edges`** per color batch. All inner iterations for a **substep** live in **`one`** labeled compute pass (`cloth_pass_distance_gauss_seidel`): ordered dispatches imply storage dependencies between clears and batches; dynamic uniform offsets on `binding(19)` (`GS_BATCH_DYNAMIC_STRIDE`) select each GS batch.
-//! One such pass runs **per substep** (**not per inner iteration**).
+//! **Gauss–Seidel batches:** Each inner iteration clears λ (`clear_constraint_lambda`), then **`gs_edges`** per color batch. Ordered dispatches in one compute pass imply storage dependencies between clears and batches; dynamic uniform offsets on `binding(19)` (`GS_BATCH_DYNAMIC_STRIDE`) select each GS batch.
+//! Integrate, constraint iterations, jac copy, post-velocity, and normals share **one** compute pass per frame (`cloth_sim`) when self-collision is off. The pass ends only around `queue.write_buffer` of the radix-digit uniform so that upload is visible to the following collision dispatches.
 //!
 //! **Dispatch counts:** with **`solve_substeps = S`**, **`solve_inner_iterations = I`**, mesh batch count `B`,
 //! **`predict_copy_sim_to_jac`** merges integrate + jac copy (**6** tail dispatches/substep vs 7 historically):
@@ -1269,6 +1269,16 @@ fn run_cloth_sim(
 }
 
 #[cfg(feature = "solver-gauss-seidel")]
+fn ready_pipeline<'a>(
+    cache: &'a PipelineCache,
+    id: CachedComputePipelineId,
+) -> &'a ComputePipeline {
+    cache
+        .get_compute_pipeline(id)
+        .expect("cloth compute pipeline is ready")
+}
+
+#[cfg(feature = "solver-gauss-seidel")]
 fn run_cloth_sim_gauss_seidel(
     render_context: &mut RenderContext,
     last_ack_step_serial: &mut u64,
@@ -1310,43 +1320,52 @@ fn run_cloth_sim_gauss_seidel(
     const DYN_IDLE: &[u32] = &[0];
     let encoder = render_context.command_encoder();
 
+    let predict = ready_pipeline(pipeline_cache, pipeline.predict_copy_sim_to_jac);
+    let clear_lambda = ready_pipeline(pipeline_cache, pipeline.clear_constraint_lambda);
+    let gs_edges = ready_pipeline(pipeline_cache, pipeline.gs_edges);
+    let copy_jac = ready_pipeline(pipeline_cache, pipeline.copy_jac_to_sim);
+    let clear_atomics = ready_pipeline(pipeline_cache, pipeline.clear_atomics);
+    let coll_perm_identity = ready_pipeline(pipeline_cache, pipeline.coll_perm_identity_ping);
+    let hist_clear = ready_pipeline(pipeline_cache, pipeline.coll_histogram_clear);
+    let radix_count = ready_pipeline(pipeline_cache, pipeline.coll_radix_digit_count);
+    let radix_bases = ready_pipeline(pipeline_cache, pipeline.coll_radix_exclusive_bases_heads);
+    let radix_scatter = ready_pipeline(pipeline_cache, pipeline.coll_radix_digit_scatter);
+    let cell_bounds_clear = ready_pipeline(pipeline_cache, pipeline.coll_cell_bounds_clear);
+    let cell_ranges = ready_pipeline(pipeline_cache, pipeline.coll_sorted_build_cell_ranges);
+    let collide_cells = ready_pipeline(pipeline_cache, pipeline.collide_grid_cells);
+    let collide_apply = ready_pipeline(pipeline_cache, pipeline.collide_apply);
+    let post_velocity = ready_pipeline(pipeline_cache, pipeline.post_velocity);
+    let clear_norm = ready_pipeline(pipeline_cache, pipeline.clear_norm_atomics);
+    let accumulate_normals = ready_pipeline(pipeline_cache, pipeline.accumulate_normals);
+    let finalize_normals = ready_pipeline(pipeline_cache, pipeline.finalize_normals);
+
+    let sim_pass = ComputePassDescriptor {
+        label: Some("cloth_sim"),
+        timestamp_writes: None,
+    };
+    let radix_pass = ComputePassDescriptor {
+        label: Some("cloth_pass_collision_radix"),
+        timestamp_writes: None,
+    };
+
+    // One pass for the frame. End it only so `write_buffer` of the radix digit
+    // is ordered before the dispatches that read that uniform.
+    let mut pass = encoder.begin_compute_pass(&sim_pass);
     for si in 0..substeps {
         let run_collision_trio =
             coll_tail_enabled && (si % col_stride == col_stride.saturating_sub(1));
 
-        {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("cloth_pass_integrate_jac_seed"),
-                timestamp_writes: None,
-            });
-            pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
-            pass.set_pipeline(
-                pipeline_cache
-                    .get_compute_pipeline(pipeline.predict_copy_sim_to_jac)
-                    .unwrap(),
-            );
-            pass.dispatch_workgroups(wg64, 1, 1);
-        }
+        pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
+        pass.set_pipeline(predict);
+        pass.dispatch_workgroups(wg64, 1, 1);
 
         if n_constraints > 0 && config.constraint_batch_count > 0 {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("cloth_pass_distance_gauss_seidel"),
-                timestamp_writes: None,
-            });
             for _inner_i in 0..inner_iters {
                 pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
-                pass.set_pipeline(
-                    pipeline_cache
-                        .get_compute_pipeline(pipeline.clear_constraint_lambda)
-                        .unwrap(),
-                );
+                pass.set_pipeline(clear_lambda);
                 pass.dispatch_workgroups(wg_constraints, 1, 1);
 
-                pass.set_pipeline(
-                    pipeline_cache
-                        .get_compute_pipeline(pipeline.gs_edges)
-                        .unwrap(),
-                );
+                pass.set_pipeline(gs_edges);
                 for bat in 0..num_batches {
                     let start = config.constraint_batch_offsets[bat] as usize;
                     let end = config.constraint_batch_offsets[bat + 1] as usize;
@@ -1363,39 +1382,17 @@ fn run_cloth_sim_gauss_seidel(
             }
         }
 
-        {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("cloth_pass_collision_velocity"),
-                timestamp_writes: None,
-            });
-            pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
-            pass.set_pipeline(
-                pipeline_cache
-                    .get_compute_pipeline(pipeline.copy_jac_to_sim)
-                    .unwrap(),
-            );
-            pass.dispatch_workgroups(wg64, 1, 1);
-
-            if run_collision_trio {
-                pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
-                pass.set_pipeline(
-                    pipeline_cache
-                        .get_compute_pipeline(pipeline.clear_atomics)
-                        .unwrap(),
-                );
-                pass.dispatch_workgroups(wg256, 1, 1);
-
-                pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
-                pass.set_pipeline(
-                    pipeline_cache
-                        .get_compute_pipeline(pipeline.coll_perm_identity_ping)
-                        .unwrap(),
-                );
-                pass.dispatch_workgroups(wg_n256.max(1), 1, 1);
-            }
-        }
+        pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
+        pass.set_pipeline(copy_jac);
+        pass.dispatch_workgroups(wg64, 1, 1);
 
         if run_collision_trio {
+            pass.set_pipeline(clear_atomics);
+            pass.dispatch_workgroups(wg256, 1, 1);
+            pass.set_pipeline(coll_perm_identity);
+            pass.dispatch_workgroups(wg_n256.max(1), 1, 1);
+
+            drop(pass);
             let cb = collision_buffers.as_ref();
             for d in 0..radix_digits {
                 let radix_u = ClothCollRadixPassGpu { data: [d, 0, 0, 0] };
@@ -1405,118 +1402,41 @@ fn run_cloth_sim_gauss_seidel(
                     bytemuck::bytes_of(&radix_u),
                 );
 
-                let mut rpass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("cloth_pass_collision_radix"),
-                    timestamp_writes: None,
-                });
+                let mut rpass = encoder.begin_compute_pass(&radix_pass);
                 rpass.set_bind_group(0, &bg.cloth, DYN_IDLE);
-                rpass.set_pipeline(
-                    pipeline_cache
-                        .get_compute_pipeline(pipeline.coll_histogram_clear)
-                        .unwrap(),
-                );
+                rpass.set_pipeline(hist_clear);
                 rpass.dispatch_workgroups(1, 1, 1);
-
-                rpass.set_pipeline(
-                    pipeline_cache
-                        .get_compute_pipeline(pipeline.coll_radix_digit_count)
-                        .unwrap(),
-                );
+                rpass.set_pipeline(radix_count);
                 rpass.dispatch_workgroups(wg_n256.max(1), 1, 1);
-
-                rpass.set_pipeline(
-                    pipeline_cache
-                        .get_compute_pipeline(pipeline.coll_radix_exclusive_bases_heads)
-                        .unwrap(),
-                );
+                rpass.set_pipeline(radix_bases);
                 rpass.dispatch_workgroups(1, 1, 1);
-
-                rpass.set_pipeline(
-                    pipeline_cache
-                        .get_compute_pipeline(pipeline.coll_radix_digit_scatter)
-                        .unwrap(),
-                );
+                rpass.set_pipeline(radix_scatter);
                 rpass.dispatch_workgroups(wg_n256.max(1), 1, 1);
             }
-
-            let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("cloth_pass_collision_grid_narrow"),
-                timestamp_writes: None,
-            });
-            cpass.set_bind_group(0, &bg.cloth, DYN_IDLE);
-            cpass.set_pipeline(
-                pipeline_cache
-                    .get_compute_pipeline(pipeline.coll_cell_bounds_clear)
-                    .unwrap(),
-            );
-            cpass.dispatch_workgroups(wg_cell_clear.max(1), 1, 1);
-
-            cpass.set_pipeline(
-                pipeline_cache
-                    .get_compute_pipeline(pipeline.coll_sorted_build_cell_ranges)
-                    .unwrap(),
-            );
-            cpass.dispatch_workgroups(wg_n256.max(1), 1, 1);
-
-            cpass.set_pipeline(
-                pipeline_cache
-                    .get_compute_pipeline(pipeline.collide_grid_cells)
-                    .unwrap(),
-            );
-            cpass.dispatch_workgroups(wg_n256.max(1), 1, 1);
-
-            cpass.set_pipeline(
-                pipeline_cache
-                    .get_compute_pipeline(pipeline.collide_apply)
-                    .unwrap(),
-            );
-            cpass.dispatch_workgroups(wg64, 1, 1);
-        }
-
-        {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("cloth_pass_post_velocity"),
-                timestamp_writes: None,
-            });
+            pass = encoder.begin_compute_pass(&sim_pass);
             pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
-            pass.set_pipeline(
-                pipeline_cache
-                    .get_compute_pipeline(pipeline.post_velocity)
-                    .unwrap(),
-            );
+            pass.set_pipeline(cell_bounds_clear);
+            pass.dispatch_workgroups(wg_cell_clear.max(1), 1, 1);
+            pass.set_pipeline(cell_ranges);
+            pass.dispatch_workgroups(wg_n256.max(1), 1, 1);
+            pass.set_pipeline(collide_cells);
+            pass.dispatch_workgroups(wg_n256.max(1), 1, 1);
+            pass.set_pipeline(collide_apply);
             pass.dispatch_workgroups(wg64, 1, 1);
         }
-    }
-
-    {
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("cloth_pass_mesh_normals"),
-            timestamp_writes: None,
-        });
-        pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
-        pass.set_pipeline(
-            pipeline_cache
-                .get_compute_pipeline(pipeline.clear_norm_atomics)
-                .unwrap(),
-        );
-        pass.dispatch_workgroups(wg256, 1, 1);
 
         pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
-        pass.set_pipeline(
-            pipeline_cache
-                .get_compute_pipeline(pipeline.accumulate_normals)
-                .unwrap(),
-        );
-        pass.dispatch_workgroups(wg_tris, 1, 1);
-
-        pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
-        pass.set_pipeline(
-            pipeline_cache
-                .get_compute_pipeline(pipeline.finalize_normals)
-                .unwrap(),
-        );
+        pass.set_pipeline(post_velocity);
         pass.dispatch_workgroups(wg64, 1, 1);
     }
+
+    pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
+    pass.set_pipeline(clear_norm);
+    pass.dispatch_workgroups(wg256, 1, 1);
+    pass.set_pipeline(accumulate_normals);
+    pass.dispatch_workgroups(wg_tris, 1, 1);
+    pass.set_pipeline(finalize_normals);
+    pass.dispatch_workgroups(wg64, 1, 1);
 
     *last_ack_step_serial = ctrl.step_serial;
 }

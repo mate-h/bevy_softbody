@@ -1,22 +1,22 @@
 #import bevy_pbr::{
     mesh_functions,
     mesh_bindings::mesh,
-    forward_io::{Vertex, VertexOutput},
     view_transformations::position_world_to_clip,
 }
 
+#ifdef PREPASS_PIPELINE
+#import bevy_pbr::prepass_io::{Vertex, VertexOutput};
+#else
+#import bevy_pbr::forward_io::{Vertex, VertexOutput};
+#endif
+
+#ifndef PREPASS_PIPELINE
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing},
 }
-
-#ifdef PREPASS_PIPELINE
-#import bevy_pbr::{
-    pbr_deferred_functions::deferred_output,
-}
-#endif
-
 #import bevy_pbr::forward_io::FragmentOutput
+#endif
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var<storage, read> sim_positions: array<vec4<f32>>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var<storage, read> sim_normals: array<vec4<f32>>;
@@ -46,6 +46,7 @@ fn vertex(vertex: Vertex, @builtin(vertex_index) vertex_index: u32) -> VertexOut
     var world_from_local = mesh_world_from_local;
 #endif
 
+#ifndef PREPASS_PIPELINE
 #ifdef VERTEX_NORMALS
 #ifdef SKINNED
     out.world_normal = bevy_pbr::skinning::skin_normals(world_from_local, vertex.normal);
@@ -54,14 +55,55 @@ fn vertex(vertex: Vertex, @builtin(vertex_index) vertex_index: u32) -> VertexOut
     out.world_normal = mesh_functions::mesh_normal_local_to_world(sn, vertex.instance_index);
 #endif
 #endif
+#endif
 
 #ifdef VERTEX_POSITIONS
     let sp = sim_positions[vi].xyz;
-    out.world_position =
+    let world =
         mesh_functions::mesh_position_local_to_world(world_from_local, vec4<f32>(sp, 1.0));
-    out.position = position_world_to_clip(out.world_position.xyz);
+#ifdef PREPASS_PIPELINE
+    out.world_position = world;
+    out.position = position_world_to_clip(world.xyz);
+#ifdef UNCLIPPED_DEPTH_ORTHO_EMULATION
+    out.unclipped_depth = out.position.z;
+    out.position.z = min(out.position.z, 1.0);
+#endif
+#ifdef VERTEX_UVS_A
+    out.uv = vertex.uv;
+#endif
+#ifdef VERTEX_UVS_B
+    out.uv_b = vertex.uv_b;
+#endif
+#ifdef NORMAL_PREPASS_OR_DEFERRED_PREPASS
+#ifdef VERTEX_NORMALS
+#ifdef SKINNED
+    out.world_normal = bevy_pbr::skinning::skin_normals(world_from_local, vertex.normal);
+#else
+    let sn = sim_normals[vi].xyz;
+    out.world_normal = mesh_functions::mesh_normal_local_to_world(sn, vertex.instance_index);
+#endif
+#endif
+#ifdef VERTEX_TANGENTS
+    out.world_tangent = mesh_functions::mesh_tangent_local_to_world(
+        world_from_local,
+        vertex.tangent,
+        vertex.instance_index,
+    );
+#endif
+#endif
+#ifdef VERTEX_COLORS
+    out.color = vertex.color;
+#endif
+#ifdef VERTEX_OUTPUT_INSTANCE_INDEX
+    out.instance_index = vertex.instance_index;
+#endif
+#else
+    out.world_position = world;
+    out.position = position_world_to_clip(world.xyz);
+#endif
 #endif
 
+#ifndef PREPASS_PIPELINE
 #ifdef VERTEX_UVS_A
     out.uv = vertex.uv;
 #endif
@@ -87,10 +129,12 @@ fn vertex(vertex: Vertex, @builtin(vertex_index) vertex_index: u32) -> VertexOut
         mesh_world_from_local[3],
     );
 #endif
+#endif
 
     return out;
 }
 
+#ifndef PREPASS_PIPELINE
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     var pbr_input = pbr_input_from_standard_material(in, is_front);
@@ -102,12 +146,9 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     }
     pbr_input.material.base_color = alpha_discard(pbr_input.material, alb);
 
-#ifdef PREPASS_PIPELINE
-    return deferred_output(in, pbr_input);
-#else
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
     return out;
-#endif
 }
+#endif
